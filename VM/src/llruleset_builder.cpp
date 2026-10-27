@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cstring>
+#include <string_view>
 
 #include "lua.h"
 #include "lcommon.h"
@@ -19,10 +20,18 @@
 #include "lstrbuf.h"
 #include "lvm.h"
 
+// Most rulesets back their flags with a single integer field
+static constexpr size_t kMaxFlagFields = 4;
+// Bounds the per-call value array kept on the stack while serializing
+static constexpr size_t kMaxDescs = 64;
+
 struct RulesetBuilderDef
 {
     std::vector<RulesetParamDescriptor> descs;     // sorted by tag; .name points into string literals
     std::vector<RulesetFlagDescriptor>  flag_descs;
+    std::vector<int>                    flag_fields; // distinct field_tags in flag_descs
+    // property name -> index into descs, or ~index into flag_descs
+    std::unordered_map<std::string_view, int> name_index;
 };
 
 namespace
@@ -206,6 +215,10 @@ RulesetBuilderDef* ruleset_builder_def_build(
         [](const RulesetParamDescriptor& a, const RulesetParamDescriptor& b) {
             return a.tag < b.tag;
         });
+    LUAU_ASSERT(def->descs.size() <= kMaxDescs);
+
+    for (size_t i = 0; i < def->descs.size(); ++i)
+        def->name_index.emplace(def->descs[i].name, int(i));
 
     return def;
 }
@@ -218,6 +231,16 @@ void ruleset_builder_def_add_flags(
 {
     // .name pointers reference string literals -- no deep copy needed.
     def->flag_descs.assign(descs, descs + count);
+
+    for (const auto& fdesc : def->flag_descs)
+    {
+        if (std::find(def->flag_fields.begin(), def->flag_fields.end(), fdesc.field_tag) == def->flag_fields.end())
+            def->flag_fields.push_back(fdesc.field_tag);
+    }
+    LUAU_ASSERT(def->flag_fields.size() <= kMaxFlagFields);
+
+    for (size_t i = 0; i < def->flag_descs.size(); ++i)
+        def->name_index.emplace(def->flag_descs[i].name, ~int(i));
 }
 
 void slua_ruleset_fix_names(lua_State* L, const RulesetBuilderDef* def)
@@ -239,56 +262,84 @@ void slua_ruleset_serialize(lua_State* L, int params_idx, const RulesetBuilderDe
     // list, field value, strbuf, element, tostring call
     luaL_checkstack(L, 8, "ruleset");
 
-    lua_newtable(L);
+    if (!has_params)
+    {
+        lua_newtable(L);
+        return; // empty list
+    }
+
+    // Phase 1: walk the keys present, collecting param values by descriptor index
+    // and accumulating flag bits per backing field, indexed like def->flag_fields.
+    LuaTable* params_h = hvalue(luaA_toobject(L, params_idx));
+    const TValue* values[kMaxDescs];
+    std::fill(values, values + def->descs.size(), luaO_nilobject);
+    int  flag_set_bits[kMaxFlagFields]   = {}; // bits to OR in
+    int  flag_clear_bits[kMaxFlagFields] = {}; // bits to AND out
+    bool flag_touched[kMaxFlagFields]    = {};
+    int  present = 0;
+    for (int index = 0; (index = lua_rawiter(L, params_idx, index)) >= 0;)
+    {
+        if (lua_type(L, -2) != LUA_TSTRING)
+        {
+            lua_pop(L, 2);
+            continue;
+        }
+
+        // Holding the pointer is fine: the params table is on the stack and
+        // nothing below runs script code to mutate it.
+        TString* key = tsvalue(luaA_toobject(L, -2));
+        lua_pop(L, 2);
+
+        auto found = def->name_index.find(std::string_view(getstr(key), key->len));
+        if (found == def->name_index.end())
+            continue;
+
+        const TValue* val = luaH_getstr(params_h, key);
+        ++present;
+        if (found->second >= 0)
+        {
+            values[found->second] = val;
+            continue;
+        }
+
+        const auto& fdesc = def->flag_descs[~found->second];
+        bool set;
+        if (ttisboolean(val))
+            set = bvalue(val) != 0;
+        else if (ttisnumber(val))
+            set = nvalue(val) != 0.0;
+        else
+            luaL_error(L, "%s must be a boolean or number", fdesc.name);
+        size_t field = std::find(def->flag_fields.begin(), def->flag_fields.end(), fdesc.field_tag) - def->flag_fields.begin();
+        flag_touched[field] = true;
+        if (set)
+            flag_set_bits[field]   |= fdesc.mask;
+        else
+            flag_clear_bits[field] |= fdesc.mask;
+    }
+
+    // Room for a tag/value pair per present key, collections grow it as needed
+    lua_createtable(L, 2 * present, 0);
     int list = lua_gettop(L);
     int idx = 0;
 
-    if (!has_params)
-        return; // empty list
-
-    // Phase 1: accumulate flag bits per backing field.
-    LuaTable* params_h = hvalue(luaA_toobject(L, params_idx));
-    std::unordered_map<int, int> flag_set_bits;   // field_tag -> bits to OR in
-    std::unordered_map<int, int> flag_clear_bits; // field_tag -> bits to AND out
-    for (const auto& fdesc : def->flag_descs)
-    {
-        const TValue* val = luaH_getstr(params_h, luaS_new(L, fdesc.name));
-        if (!ttisnil(val))
-        {
-            bool set;
-            if (ttisboolean(val))
-                set = bvalue(val) != 0;
-            else if (ttisnumber(val))
-                set = nvalue(val) != 0.0;
-            else
-                luaL_error(L, "%s must be a boolean or number", fdesc.name);
-            if (set)
-                flag_set_bits[fdesc.field_tag]   |= fdesc.mask;
-            else
-                flag_clear_bits[fdesc.field_tag] |= fdesc.mask;
-        }
-    }
-
     // Phase 2: emit tag/value pairs in tag order.
-    for (const auto& desc : def->descs)
+    for (size_t i = 0; i < def->descs.size(); ++i)
     {
+        const auto& desc = def->descs[i];
         int  raw_int = 0;
         bool has_raw = false;
 
-        const TValue* val = luaH_getstr(params_h, luaS_new(L, desc.name));
+        const TValue* val = values[i];
         has_raw = !ttisnil(val);
         if (has_raw && ttisnumber(val))
             raw_int = lsl_float_to_int(nvalue(val));
 
         // Integer fields that back flags: merge accumulated bits.
-        auto set_it   = flag_set_bits.find(desc.tag);
-        auto clear_it = flag_clear_bits.find(desc.tag);
-        if (desc.semantic == 'i' &&
-            (set_it != flag_set_bits.end() || clear_it != flag_clear_bits.end()))
+        size_t field = std::find(def->flag_fields.begin(), def->flag_fields.end(), desc.tag) - def->flag_fields.begin();
+        if (desc.semantic == 'i' && field < def->flag_fields.size() && flag_touched[field])
         {
-            int set_mask   = (set_it   != flag_set_bits.end())   ? set_it->second   : 0;
-            int clear_mask = (clear_it != flag_clear_bits.end()) ? clear_it->second : 0;
-            int merged = (raw_int | set_mask) & ~clear_mask;
+            int merged = (raw_int | flag_set_bits[field]) & ~flag_clear_bits[field];
             lua_pushinteger(L, desc.tag);
             lua_rawseti(L, list, ++idx);
             lua_pushinteger(L, merged);
