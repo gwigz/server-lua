@@ -124,9 +124,18 @@ static int prim_params_rule_wrapper(lua_State *L)
 static constexpr int INITIAL_RULE_SLOTS = 16;
 
 // Convenience ctor, metatable lives in upvalue 1, so this skips a global lookup per call.
+// An optional size hint reserves room for that many list values (not rules).
+// Non-number arguments are ignored, so `ParamSetter:new()` keeps working.
 static int prim_params_setter_new(lua_State *L)
 {
-    lua_createtable(L, INITIAL_RULE_SLOTS, 0);
+    int slots = INITIAL_RULE_SLOTS;
+    if (lua_type(L, 1) == LUA_TNUMBER)
+    {
+        slots = luaL_checkinteger(L, 1);
+        luaL_argcheck(L, slots >= 0, 1, "size hint must not be negative");
+    }
+
+    lua_createtable(L, slots, 0);
     lua_pushvalue(L, lua_upvalueindex(1));
     lua_setmetatable(L, -2);
     return 1;

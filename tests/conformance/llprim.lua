@@ -21,6 +21,18 @@ assert(rules[1] == PRIM_POSITION and rules[2] == vector(0, 0, 0))
 assert(rules[3] == PRIM_SIZE and rules[4] == vector(1, 1, 1))
 assert(rules[5] == PRIM_MATERIAL and rules[6] == 2)
 
+-- new() takes an optional size hint, counted in list values rather than rules.
+rules = ParamSetter.new(18):pos(vector(0, 0, 0)):physicsMaterial(2)
+assert(#rules == 4)
+assert(rules[1] == PRIM_POSITION and rules[3] == PRIM_MATERIAL)
+assert(#ParamSetter.new(0):name("foo") == 2)
+assert(#ParamSetter.new(1):extend({PRIM_SIZE, vector(1, 1, 1), PRIM_NAME, "foo"}) == 4)
+assert(getmetatable(ParamSetter.new(4)) == ParamSetter)
+assert(not pcall(function() ParamSetter.new(-1) end))
+
+-- Method-style calls pass the metatable as the hint, which is ignored.
+assert(#ParamSetter:new():name("foo") == 2)
+
 -- face_target rules take a face index as the first arg.
 rules = ParamSetter.new():color(0, vector(1, 0.5, 0), 0.75)
 assert(#rules == 4)
