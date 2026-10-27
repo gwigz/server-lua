@@ -120,10 +120,13 @@ static int prim_params_rule_wrapper(lua_State *L)
     return 1;
 }
 
+// Room for a few rules up front, so short chains skip most of the array growth
+static constexpr int INITIAL_RULE_SLOTS = 16;
+
 // Convenience ctor, metatable lives in upvalue 1, so this skips a global lookup per call.
 static int prim_params_setter_new(lua_State *L)
 {
-    lua_createtable(L, 0, 0);
+    lua_createtable(L, INITIAL_RULE_SLOTS, 0);
     lua_pushvalue(L, lua_upvalueindex(1));
     lua_setmetatable(L, -2);
     return 1;
